@@ -1,0 +1,25 @@
+# baize config -- ~/.config/baize/config
+# Written by `baize install`; hand-editing is fine, this file is never
+# touched by `baize update`. Shell KEY=VALUE, sourced with `.`.
+
+# GlitchTip DSN -- https://<public_key>@glitchtip.example.com/<project_id>
+DSN="https://abc123@glitchtip.example.com/7"
+
+# Space-separated mount points to watch.
+MOUNTS="/"
+
+# Alert when used percentage is >= this. Must be an integer 1-99.
+THRESHOLD=85
+
+# While still breached, re-send an event this often (hours).
+RESTATE_HOURS=24
+
+# Optional GlitchTip heartbeat check-in URL. Empty/unset = heartbeat disabled.
+HEARTBEAT_URL=""
+
+# How often cron invokes `baize run`. <N>m where N divides 60 evenly
+# (1 2 3 4 5 6 10 12 15 20 30), or <N>h where N divides 24 evenly
+# (1 2 3 4 6 8 12). Anything else is rejected at install time -- an interval
+# that doesn't divide its unit evenly (e.g. */7) silently drifts the
+# schedule instead of firing at a constant period.
+INTERVAL="15m"

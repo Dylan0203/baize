@@ -15,18 +15,25 @@ state_file()  { printf '%s\n' "$(state_dir)/state"; }
 bin_path()    { printf '%s\n' "$HOME/.local/bin/baize"; }
 
 # --- Config loader -----------------------------------------------------------
-# Sets globals: DSN MOUNTS THRESHOLD RESTATE_HOURS HEARTBEAT_URL
+# Sets globals: DSN MOUNTS THRESHOLD RESTATE_HOURS HEARTBEAT_URL INTERVAL
 #
 # Defaults live here; the config file (if present) overrides them via `.`.
 # A config missing keys must still work. DSN is the only required key, but
 # load_config does NOT enforce it -- `baize check` is useful without a DSN,
 # and `install` is what writes the DSN. Enforcing it is require_dsn's job.
+#
+# INTERVAL is install-only metadata (it drives the cron schedule, nothing
+# else reads it at runtime) but it is persisted here anyway so a re-install
+# that doesn't pass --interval keeps the previous schedule instead of
+# silently reverting to the default -- the same "flag -> existing config ->
+# default" rule every other install flag follows.
 load_config() {
   DSN=""
   MOUNTS="/"
   THRESHOLD=85
   RESTATE_HOURS=24
   HEARTBEAT_URL=""
+  INTERVAL="15m"
 
   local cf; cf="$(config_file)"
   if [[ -f "$cf" ]]; then
@@ -55,11 +62,54 @@ EOF
 # Current Unix epoch seconds on stdout.
 now_epoch() { date +%s; }
 
-# Used percentage (integer, no % sign) for mount $1 on stdout. Non-zero if unknown.
-disk_used_pct() { return 1; }   # implemented later — deliberately unimplemented seam
+# Used percentage (integer, no % sign) for mount $1 on stdout.
+# Returns non-zero if the mount cannot be read or the output cannot be parsed.
+#
+# -P selects POSIX output format, which guarantees one line per filesystem;
+# without it, a long device name wraps onto a second line and the capacity
+# column shifts to the wrong row on hosts with long device paths.
+disk_used_pct() {
+  local mount="$1" out pct
+  out="$(df -P "$mount" 2>/dev/null)" || return 1
+  pct="$(printf '%s\n' "$out" | awk 'NR==2 {gsub(/%/,"",$5); print $5}')"
+  # A df that prints a warning, an empty table, or a "-" capacity must fail
+  # loudly here rather than let an empty string reach a numeric comparison.
+  [[ "$pct" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$pct"
+}
 
-# POST $2 (body, may be empty) to URL $1. Non-zero on failure. Never prints secrets.
-http_post() { return 1; }       # implemented later — deliberately unimplemented seam
+# Prints "<mount> <pct>" per readable mount in MOUNTS. Unreadable mounts warn
+# on stderr and are skipped -- one vanished mount must not stop the others
+# from being checked.
+each_mount_pct() {
+  local mount pct
+  # shellcheck disable=SC2086  # MOUNTS is space-separated by design
+  for mount in $MOUNTS; do
+    if pct="$(disk_used_pct "$mount")"; then
+      printf '%s %s\n' "$mount" "$pct"
+    else
+      printf 'baize: cannot read disk usage for mount: %s\n' "$mount" >&2
+    fi
+  done
+}
+
+# POST $2 (body, may be empty) to URL $1 with Content-Type $3 (default
+# application/json). Non-zero on failure. Never prints secrets.
+#
+# --max-time bounds a hung TLS connection so a cron process never survives
+# until the next one starts. -f turns an HTTP error status into a non-zero
+# exit. -o /dev/null keeps the response body out of cron mail. $url is never
+# logged here or by any caller -- it carries ?sentry_key=; error messages say
+# "failed to send event to GlitchTip", never the URL.
+http_post() {
+  local url="$1" body="$2" ctype="${3:-application/json}"
+  printf '%s' "$body" | curl -sS -f -X POST \
+    -H "Content-Type: $ctype" \
+    --max-time 10 \
+    --data-binary @- \
+    -o /dev/null \
+    "$url"
+}
 
 # --- Shared helpers ----------------------------------------------------------
 
@@ -76,15 +126,400 @@ epoch_to_rfc3339() {
   TZ=UTC printf '%(%Y-%m-%dT%H:%M:%SZ)T\n' "$epoch"
 }
 
+# --- GlitchTip envelope --------------------------------------------------------
+
+# Parses a GlitchTip DSN "https://<key>@host/<project_id>".
+# Sets globals: DSN_KEY DSN_HOST DSN_PROJECT. Returns non-zero on a malformed
+# DSN. https-only, not https? -- the DSN GlitchTip issues is always https, so
+# a one-character typo that produced an http:// URL would ship alerts in
+# plaintext to a port GlitchTip probably is not even listening on, and baize
+# has no way to tell "rejected" from "nobody home". Reject loudly instead.
+parse_dsn() {
+  local dsn="$1"
+  [[ "$dsn" =~ ^https://([^@/]+)@([^/]+)/([0-9]+)/?$ ]] || return 1
+  DSN_KEY="${BASH_REMATCH[1]}"
+  DSN_HOST="${BASH_REMATCH[2]}"
+  DSN_PROJECT="${BASH_REMATCH[3]}"
+}
+
+# 32 lowercase hex characters, no dashes, on stdout.
+# uuidgen is not guaranteed on a minimal Ubuntu host; /proc/sys/kernel/random/uuid
+# and /dev/urandom always are, so this needs neither uuidgen nor a new dependency.
+new_event_id() {
+  if [[ -r /proc/sys/kernel/random/uuid ]]; then
+    tr -d '-' < /proc/sys/kernel/random/uuid
+    printf '\n'
+  else
+    od -An -tx1 -N16 /dev/urandom | tr -d ' \n'
+    printf '\n'
+  fi
+}
+
+# Escapes $1 for embedding in a JSON string literal (no surrounding quotes).
+# There is no jq on the target hosts, so every interpolated string must be
+# escaped here or a mount/host name containing a quote produces a malformed
+# envelope that GlitchTip silently rejects. Backslash must be escaped first,
+# or the later replacements' own backslashes get double-escaped.
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\t'/\\t}"
+  s="${s//$'\r'/\\r}"
+  printf '%s' "$s"
+}
+
+# send_event <level> <type> <value> <fingerprint_prefix> <mount> [extra_json]
+#   level               warning | info | error
+#   type                exception type, becomes the issue title prefix (e.g. DiskUsageHigh)
+#   value               exception value, the human-readable half of the title
+#   fingerprint_prefix  disk-breach | disk-recovery | baize-test | baize-removed
+#   mount               the mount this concerns, or "-" when not mount-specific
+#   extra_json          optional pre-built JSON object body for "extra", without
+#                       braces, e.g. '"used_pct":88,"threshold_pct":85'. When
+#                       omitted, the "extra" key is left out of the payload
+#                       entirely -- not "extra":{}, and above all not a bare
+#                       "extra": with nothing after it, which is malformed
+#                       JSON that GlitchTip rejects while baize reports success.
+# Returns non-zero if the event could not be sent.
+#
+# The fingerprint is ["<prefix>", "<server_name>", "<mount>"] -- the exact
+# reason repeats collapse into one issue instead of hundreds. The percentage
+# belongs in tags/extra/value, never the fingerprint.
+send_event() {
+  local level="$1" type="$2" value="$3" fp_prefix="$4" mount="$5" extra_json="${6:-}"
+
+  parse_dsn "$DSN" || {
+    printf 'baize: DSN is malformed, expected https://<key>@host/<project_id>\n' >&2
+    return 1
+  }
+
+  local host; host="$(server_name)"
+  # Computed once and reused for both the envelope header and the event
+  # payload, so sent_at and timestamp can never disagree.
+  local ts; ts="$(epoch_to_rfc3339)"
+  local event_id; event_id="$(new_event_id)"
+
+  local extra_field=""
+  [[ -n "$extra_json" ]] && extra_field=",\"extra\":{$extra_json}"
+
+  # Exactly one line, no embedded newlines -- the envelope's item header
+  # omits "length", so the payload runs to the next newline.
+  local event_json
+  event_json="{\"event_id\":\"$event_id\",\"timestamp\":\"$ts\",\"platform\":\"other\",\"level\":\"$level\",\"logger\":\"baize\",\"server_name\":\"$(json_escape "$host")\",\"release\":\"baize@$BAIZE_VERSION\",\"fingerprint\":[\"$(json_escape "$fp_prefix")\",\"$(json_escape "$host")\",\"$(json_escape "$mount")\"],\"tags\":{\"host\":\"$(json_escape "$host")\",\"mount\":\"$(json_escape "$mount")\"},\"exception\":{\"values\":[{\"type\":\"$(json_escape "$type")\",\"value\":\"$(json_escape "$value")\"}]}$extra_field}"
+
+  # $(...) strips all trailing newlines, so the trailing newline after the
+  # last item is built with the printf format ending mid-line and appended
+  # back explicitly, rather than lost to the substitution.
+  local envelope
+  envelope="$(printf '%s\n%s\n%s' \
+    "{\"event_id\":\"$event_id\",\"sent_at\":\"$ts\"}" \
+    '{"type":"event","content_type":"application/json"}' \
+    "$event_json")"
+  envelope+=$'\n'
+
+  local url="https://$DSN_HOST/api/$DSN_PROJECT/envelope/?sentry_key=$DSN_KEY"
+
+  if ! http_post "$url" "$envelope" "application/x-sentry-envelope"; then
+    printf 'baize: failed to send event to GlitchTip\n' >&2
+    return 1
+  fi
+}
+
+# --- State machine ------------------------------------------------------------
+# ~/.local/state/baize/state -- one line per mount, space-separated:
+#   <mount> <level> <last_sent_epoch>
+# <level> is "ok" or "breach"; <last_sent_epoch> is Unix seconds or 0.
+
+# Prints "<level> <last_sent_epoch>" for mount $1. Prints "ok 0" when unknown.
+read_state() {
+  local mount="$1" sf line
+  sf="$(state_file)"
+  [[ -r "$sf" ]] || { printf 'ok 0\n'; return 0; }
+  line="$(awk -v m="$mount" 'BEGIN {found=0} $1 == m {print $2, $3; found=1} END {if (!found) print "ok", 0}' "$sf")"
+  printf '%s\n' "$line"
+}
+
+# Warns on stderr that the state file could not be written. Never fails the
+# run -- baize's job is alerting, not bookkeeping.
+warn_state() {
+  printf 'baize: could not write state file %s -- state unchanged, next run will retry\n' "$(state_file)" >&2
+}
+
+# Sets mount $1 to level $2 with last_sent $3, preserving other mounts' lines.
+write_state() {
+  local mount="$1" level="$2" sent="$3" sf tmp
+  sf="$(state_file)"
+  mkdir -p "$(dirname "$sf")" 2>/dev/null || { warn_state; return 0; }
+  tmp="$(mktemp "${sf}.XXXXXX" 2>/dev/null)" || { warn_state; return 0; }
+  if { [[ -r "$sf" ]] && awk -v m="$mount" '$1 != m' "$sf"; printf '%s %s %s\n' "$mount" "$level" "$sent"; } > "$tmp" \
+    && mv -f "$tmp" "$sf"; then
+    return 0
+  fi
+  rm -f "$tmp"
+  warn_state
+  return 0
+}
+
+# decide_action <pct> <threshold> <level> <last_sent> <now> <restate_hours>
+# Prints exactly one of: breach | restate | recovery | none
+#
+# The threshold is >=, not >: THRESHOLD=85 means 85% alerts.
+#
+# The state update that pairs with each action (applied by the caller, only
+# after a successful send -- a failed send must leave state untouched so the
+# next run retries):
+#   breach   -> level=breach, last_sent=now
+#   restate  -> level=breach, last_sent=now
+#   recovery -> level=ok,     last_sent=0
+#   none     -> unchanged
+decide_action() {
+  local pct="$1" threshold="$2" level="$3" last_sent="$4" now="$5" restate_hours="$6"
+  local over=0
+  (( pct >= threshold )) && over=1
+
+  if (( over == 1 )); then
+    if [[ "$level" != "breach" ]]; then
+      printf 'breach\n'
+    elif (( now - last_sent >= restate_hours * 3600 )); then
+      printf 'restate\n'
+    else
+      printf 'none\n'
+    fi
+  else
+    if [[ "$level" == "breach" ]]; then
+      printf 'recovery\n'
+    else
+      printf 'none\n'
+    fi
+  fi
+}
+
+# --- Install: config rendering, interval parsing, crontab marker block --------
+
+# The annotated config body for the *current* values of DSN MOUNTS THRESHOLD
+# RESTATE_HOURS HEARTBEAT_URL INTERVAL, on stdout. This is the single
+# generator for ~/.config/baize/config -- cmd_install always rewrites the
+# whole file from this, never appends, so a re-install can't accumulate
+# duplicate keys where the last one silently wins. Keep the comments here in
+# sync with config.example by hand; config.example is dev-only documentation
+# and is never shipped to a host, so it cannot be read back at install time.
+render_config() {
+  cat <<EOF
+# baize config -- ~/.config/baize/config
+# Written by \`baize install\`; hand-editing is fine, this file is never
+# touched by \`baize update\`. Shell KEY=VALUE, sourced with \`.\`.
+
+# GlitchTip DSN -- https://<public_key>@glitchtip.example.com/<project_id>
+DSN="$DSN"
+
+# Space-separated mount points to watch.
+MOUNTS="$MOUNTS"
+
+# Alert when used percentage is >= this. Must be an integer 1-99.
+THRESHOLD=$THRESHOLD
+
+# While still breached, re-send an event this often (hours).
+RESTATE_HOURS=$RESTATE_HOURS
+
+# Optional GlitchTip heartbeat check-in URL. Empty/unset = heartbeat disabled.
+HEARTBEAT_URL="$HEARTBEAT_URL"
+
+# How often cron invokes \`baize run\`. <N>m where N divides 60 evenly
+# (1 2 3 4 5 6 10 12 15 20 30), or <N>h where N divides 24 evenly
+# (1 2 3 4 6 8 12). Anything else is rejected at install time -- an interval
+# that doesn't divide its unit evenly (e.g. */7) silently drifts the
+# schedule instead of firing at a constant period.
+INTERVAL="$INTERVAL"
+EOF
+}
+
+# Cron schedule for interval string $1 (e.g. "15m", "6h"), on stdout.
+#   "15m" -> "*/15 * * * *"   "1h" -> "0 * * * *"   "6h" -> "0 */6 * * *"
+# Only minute values that divide 60 evenly and hour values that divide 24
+# evenly are accepted -- e.g. "*/7 * * * *" fires at :00 :07 ... :56 and
+# then :00 again, a 4-minute gap at the top of every hour. An interval that
+# lies about its own period is rejected rather than silently honored.
+# Prints nothing and returns non-zero, with the accepted values listed on
+# stderr, for anything else.
+cron_schedule_from_interval() {
+  local interval="$1" n
+
+  if [[ "$interval" =~ ^([0-9]+)m$ ]]; then
+    n="${BASH_REMATCH[1]}"
+    case "$n" in
+      1) printf '* * * * *\n'; return 0 ;;
+      2|3|4|5|6|10|12|15|20|30) printf '*/%s * * * *\n' "$n"; return 0 ;;
+    esac
+  elif [[ "$interval" =~ ^([0-9]+)h$ ]]; then
+    n="${BASH_REMATCH[1]}"
+    case "$n" in
+      1) printf '0 * * * *\n'; return 0 ;;
+      2|3|4|6|8|12) printf '0 */%s * * *\n' "$n"; return 0 ;;
+    esac
+  fi
+
+  printf 'baize: invalid --interval: %s\n  Accepted minute values: 1 2 3 4 5 6 10 12 15 20 30 (e.g. 15m)\n  Accepted hour values:   1 2 3 4 6 8 12 (e.g. 6h)\n' "$interval" >&2
+  return 1
+}
+
+# Prints the current crontab, or nothing if there is none. `crontab -l`
+# exits non-zero when there is no crontab at all, which under `set -euo
+# pipefail` would abort the install on a fresh box -- the `|| true` is
+# load-bearing, not decoration.
+read_crontab() { crontab -l 2>/dev/null || true; }
+
+# Replaces (or inserts) the baize marker block; everything outside the
+# markers is byte-identical. This is the only function that touches the
+# crontab, so the marker-block logic lives in exactly one readable place.
+#
+# Blank lines are NOT filtered globally -- a `grep -v '^$'` here would strip
+# every blank line in the user's crontab, including ones they put between
+# their own entries for readability. The only blank worth removing is a
+# single leading one that appears when $current was empty, hence
+# `sed '1{/^$/d}'` rather than a global purge.
+write_crontab_block() {
+  local block="$1" current stripped
+  current="$(read_crontab)"
+  stripped="$(printf '%s\n' "$current" | awk '
+    /^# BEGIN baize$/ {skip=1; next}
+    /^# END baize$/   {skip=0; next}
+    !skip
+  ')"
+  # The trailing ";" before the closing brace is needed for BSD sed (macOS
+  # dev machines); GNU sed (the Ubuntu target) accepts it identically.
+  printf '%s\n%s\n' "$stripped" "$block" | sed '1{/^$/d;}' | crontab -
+}
+
+# The "# BEGIN baize" .. "# END baize" block for the current INTERVAL, on
+# stdout. Uses the expanded absolute path from bin_path, not "$HOME/..." --
+# cron's environment is not a login shell, and while $HOME is set there,
+# relying on it buys nothing and only surprises whoever reads `crontab -l`.
+# No PATH= line is added: cron's PATH (typically /usr/bin:/bin) already
+# covers curl/df/sha256sum/date/hostname on Ubuntu, so one would be
+# speculative.
+cron_block() {
+  local schedule
+  schedule="$(cron_schedule_from_interval "$INTERVAL")" || return 1
+  printf '# BEGIN baize\n%s %s run\n# END baize' "$schedule" "$(bin_path)"
+}
+
+# `baize install [--dsn URL] [--threshold N] [--interval Nm|Nh] [--heartbeat URL] [--dry-run]`
+#
+# Merge order per key is flag -> existing config -> built-in default:
+# load_config first populates existing-or-default, then flags override, then
+# the whole file is rewritten from the resolved values. Never appended --
+# appending is how repeated installs end up with duplicate keys where the
+# last one silently wins.
+cmd_install() {
+  local dsn="" threshold="" interval="" heartbeat="" dry_run=0
+  local dsn_given=0 threshold_given=0 interval_given=0 heartbeat_given=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dsn|--threshold|--interval|--heartbeat)
+        if [[ $# -lt 2 ]]; then
+          printf 'baize install: %s requires a value\n' "$1" >&2
+          return 2
+        fi
+        case "$1" in
+          --dsn)       dsn="$2";       dsn_given=1 ;;
+          --threshold) threshold="$2"; threshold_given=1 ;;
+          --interval)  interval="$2";  interval_given=1 ;;
+          --heartbeat) heartbeat="$2"; heartbeat_given=1 ;;
+        esac
+        shift 2
+        ;;
+      --dry-run)
+        dry_run=1
+        shift
+        ;;
+      *)
+        printf 'baize install: unknown flag: %s\n  Valid flags: --dsn --threshold --interval --heartbeat --dry-run\n' "$1" >&2
+        return 2
+        ;;
+    esac
+  done
+
+  load_config
+  [[ "$dsn_given" -eq 1 ]]       && DSN="$dsn"
+  [[ "$threshold_given" -eq 1 ]] && THRESHOLD="$threshold"
+  [[ "$interval_given" -eq 1 ]]  && INTERVAL="$interval"
+  [[ "$heartbeat_given" -eq 1 ]] && HEARTBEAT_URL="$heartbeat"
+
+  # --- Validate up front; every error names the fix. ---
+  if [[ -z "$DSN" ]]; then
+    printf 'baize install: --dsn is required on first install\n  Example: baize install --dsn https://<key>@glitchtip.example.com/<project_id>\n' >&2
+    return 1
+  fi
+  if ! [[ "$DSN" =~ ^https://[^@[:space:]/]+@[^/[:space:]]+/[0-9]+/?$ ]]; then
+    printf 'baize install: malformed --dsn: %s\n  Expected: https://<public_key>@glitchtip.example.com/<project_id>\n' "$DSN" >&2
+    return 1
+  fi
+  if ! [[ "$THRESHOLD" =~ ^[0-9]+$ ]] || (( THRESHOLD < 1 || THRESHOLD > 99 )); then
+    printf 'baize install: --threshold must be an integer between 1 and 99, got: %s\n' "$THRESHOLD" >&2
+    return 1
+  fi
+  local schedule
+  schedule="$(cron_schedule_from_interval "$INTERVAL")" || return 1
+  if [[ -z "$MOUNTS" ]]; then
+    printf 'baize install: MOUNTS is empty; set at least one mount point in %s\n' "$(config_file)" >&2
+    return 1
+  fi
+
+  local body block cfile
+  body="$(render_config)"
+  block="$(cron_block)"
+  cfile="$(config_file)"
+
+  if [[ "$dry_run" -eq 1 ]]; then
+    printf '%s\n' "$body"
+    printf '%s %s run\n' "$schedule" "$(bin_path)"
+    return 0
+  fi
+
+  # holds the DSN key, hence 700/600 rather than the more usual 755/644.
+  mkdir -p "$(config_dir)"
+  chmod 700 "$(config_dir)"
+  printf '%s\n' "$body" > "$cfile"
+  chmod 600 "$cfile"
+
+  mkdir -p "$(state_dir)"
+
+  write_crontab_block "$block"
+
+  cat <<SUMMARY
+baize installed.
+  config:   $cfile
+  state:    $(state_dir)
+  schedule: $schedule ($(bin_path) run)
+
+Next: baize test
+SUMMARY
+}
+
 # --- Verb stubs ---------------------------------------------------------------
 # Real behavior arrives in later tasks. Each stub keeps this file lint-clean
 # and gives those tasks a defined slot to fill.
 
-cmd_install() { printf 'baize: not implemented yet\n' >&2; return 1; }
 cmd_remove()  { printf 'baize: not implemented yet\n' >&2; return 1; }
 cmd_check()   { printf 'baize: not implemented yet\n' >&2; return 1; }
 cmd_run()     { printf 'baize: not implemented yet\n' >&2; return 1; }
-cmd_test()    { printf 'baize: not implemented yet\n' >&2; return 1; }
+
+# Sends one baize-test event to prove the DSN and network path both work.
+# This is the one verb whose whole purpose is proving the pipe works, so its
+# failure must be loud and its success must tell the user where to look.
+cmd_test() {
+  load_config
+  require_dsn || return 1
+  if send_event info BaizeTest "baize test event from $(server_name)" baize-test "-"; then
+    printf 'Sent test event. Check the host-monitoring project in GlitchTip.\n'
+  else
+    printf 'baize: failed to send test event. Check DSN and network.\n' >&2
+    return 1
+  fi
+}
 cmd_status()  { printf 'baize: not implemented yet\n' >&2; return 1; }
 cmd_update()  { printf 'baize: not implemented yet\n' >&2; return 1; }
 

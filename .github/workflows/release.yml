@@ -1,0 +1,37 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # required to create a release; nothing more
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bats
+        run: sudo apt-get update && sudo apt-get install -y bats
+      - name: shellcheck
+        run: shellcheck baize install.sh test/helpers/stubs/*
+      - name: bats
+        shell: bash
+        run: bats test/
+      - name: Verify tag matches BAIZE_VERSION
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          src="$(grep -m1 '^BAIZE_VERSION=' baize | cut -d'"' -f2)"
+          if [[ "$tag" != "$src" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match BAIZE_VERSION=$src in baize" >&2
+            exit 1
+          fi
+      - name: Checksums
+        run: sha256sum baize > SHA256SUMS
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            baize
+            SHA256SUMS
+          generate_release_notes: true

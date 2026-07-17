@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Stub for crontab, backed by a plain file under $HOME so each bats test
+# (which gets a fresh $HOME from setup.bash) starts with no crontab. Only
+# the two invocations baize actually uses are supported:
+#   crontab -l   print the stored crontab, or fail if there is none
+#   crontab -    replace the stored crontab from stdin
+set -euo pipefail
+
+store="$HOME/.crontab_stub"
+
+case "${1:-}" in
+  -l)
+    if [[ -f "$store" ]]; then
+      cat "$store"
+    else
+      printf 'crontab: no crontab for %s\n' "${USER:-user}" >&2
+      exit 1
+    fi
+    ;;
+  -)
+    cat > "$store"
+    ;;
+  *)
+    printf 'crontab stub: unsupported invocation: %s\n' "$*" >&2
+    exit 1
+    ;;
+esac

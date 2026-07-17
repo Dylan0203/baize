@@ -7,6 +7,7 @@ setup() {
   unset XDG_CONFIG_HOME XDG_STATE_HOME
   export PATH="$BAIZE_ROOT/test/helpers/stubs:$PATH"
   export BAIZE_STUB_CURL_LOG="$TEST_TMP/curl.log"
+  export BAIZE_STUB_CURL_STDIN="$TEST_TMP/curl.stdin"
 }
 
 teardown() {

@@ -1,11 +1,76 @@
 #!/usr/bin/env bash
 # Stub for curl: records its full argument list to BAIZE_STUB_CURL_LOG,
-# prints a minimal JSON body, and exits with BAIZE_STUB_CURL_EXIT (default 0).
+# captures any piped stdin body to BAIZE_STUB_CURL_STDIN (if set, else
+# discards it so callers piping into curl never see SIGPIPE), and serves a
+# fixture response chosen by URL pattern.
+#
+# install.sh's curl calls always pass the URL last, and use `-o FILE` for
+# the two asset downloads (the releases API response goes to stdout). URLs
+# matching none of install.sh's patterns fall through to the original
+# generic stub body, so tests unrelated to install.sh (e.g. http_post to a
+# GlitchTip DSN) are unaffected by this file.
 set -euo pipefail
 
 if [[ -n "${BAIZE_STUB_CURL_LOG:-}" ]]; then
   printf '%s\n' "$*" >> "$BAIZE_STUB_CURL_LOG"
 fi
 
-printf '{"id":"stub"}\n'
-exit "${BAIZE_STUB_CURL_EXIT:-0}"
+if [[ ! -t 0 ]]; then
+  if [[ -n "${BAIZE_STUB_CURL_STDIN:-}" ]]; then
+    cat > "$BAIZE_STUB_CURL_STDIN"
+  else
+    cat > /dev/null
+  fi
+fi
+
+outfile=""
+url=""
+prev=""
+for arg in "$@"; do
+  [[ "$prev" == "-o" ]] && outfile="$arg"
+  prev="$arg"
+  url="$arg"
+done
+
+write_out() {   # write_out BODY -- to $outfile if set, else stdout
+  if [[ -n "$outfile" ]]; then
+    printf '%s' "$1" > "$outfile"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+default_baize_content='#!/usr/bin/env bash
+printf "fake-baize\n"
+'
+baize_content="${BAIZE_STUB_BAIZE_CONTENT:-$default_baize_content}"
+default_releases_json='{"tag_name":"v1.2.3"}'
+
+case "$url" in
+  */releases/latest)
+    if [[ -n "${BAIZE_STUB_CURL_RELEASES_FAIL:-}" ]]; then
+      # Mimic curl -f's exit code for an HTTP-level failure.
+      exit 22
+    fi
+    write_out "${BAIZE_STUB_RELEASES_JSON:-$default_releases_json}"
+    exit 0
+    ;;
+  */releases/download/*/baize)
+    write_out "$baize_content"
+    exit 0
+    ;;
+  */releases/download/*/SHA256SUMS)
+    if [[ -n "${BAIZE_STUB_SHA256SUMS+x}" ]]; then
+      write_out "$BAIZE_STUB_SHA256SUMS"
+    else
+      hash="$(printf '%s' "$baize_content" | sha256sum | cut -d' ' -f1)"
+      write_out "$hash  baize
+"
+    fi
+    exit 0
+    ;;
+  *)
+    printf '{"id":"stub"}\n'
+    exit "${BAIZE_STUB_CURL_EXIT:-0}"
+    ;;
+esac

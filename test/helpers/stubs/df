@@ -1,10 +1,23 @@
 #!/usr/bin/env bash
 # Stub for df -P: prints a df -P-shaped table whose used percentage comes
 # from BAIZE_STUB_DF_PCT (default 10), for whichever mount was requested.
+#
+# BAIZE_STUB_DF_EXIT overrides the exit code (default 0), simulating a
+# mount df cannot read at all.
+#
+# BAIZE_STUB_DF_RAW, if set, is printed verbatim instead of the generated
+# table, simulating output df parsing cannot make sense of (e.g. a "-"
+# capacity column).
 set -euo pipefail
+
+if [[ -n "${BAIZE_STUB_DF_RAW:-}" ]]; then
+  printf '%s\n' "$BAIZE_STUB_DF_RAW"
+  exit "${BAIZE_STUB_DF_EXIT:-0}"
+fi
 
 pct="${BAIZE_STUB_DF_PCT:-10}"
 mount="${*: -1}"
 
 printf 'Filesystem     1024-blocks     Used Available Capacity Mounted on\n'
 printf '/dev/stub          10485760  1048576   9437184      %s%% %s\n' "$pct" "$mount"
+exit "${BAIZE_STUB_DF_EXIT:-0}"

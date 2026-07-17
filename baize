@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Captured before the assignment right below reuses the same name for this
+# build's own embedded version. bash re-runs this file from the top on
+# every invocation, so an env override like `BAIZE_VERSION=v0.2.0 baize
+# update` would otherwise be silently clobbered by the very next line
+# before resolve_latest_version ever saw it. See resolve_latest_version.
+BAIZE_VERSION_PIN="${BAIZE_VERSION:-}"
+
 BAIZE_VERSION="0.1.0"
 BAIZE_REPO="Dylan0203/baize"
 
@@ -802,7 +809,208 @@ cmd_test() {
   fi
 }
 cmd_status()  { printf 'baize: not implemented yet\n' >&2; return 1; }
-cmd_update()  { printf 'baize: not implemented yet\n' >&2; return 1; }
+
+# --- Update: release resolution, verified atomic swap, rollback --------------
+
+# Prints the latest release tag (e.g. "v0.2.0") on stdout. Honors an
+# incoming BAIZE_VERSION environment variable as a pin, letting a human
+# force a specific version without touching the API -- reads it via
+# BAIZE_VERSION_PIN (captured at the very top of this file, before the
+# BAIZE_VERSION constant below is assigned) rather than $BAIZE_VERSION
+# itself, which by the time this runs always holds this build's own
+# embedded version, not whatever a caller passed in the environment.
+#
+# Shared with install.sh, which resolves releases the same way, and with
+# `baize status`'s update check, which is why this is its own function
+# rather than inlined into cmd_update -- see docs/baize-v0-1 shared context
+# on the paired-change surface: change one, mirror the other.
+#
+# No jq -- the host is not allowed to need one. Never falls back to raw
+# `main`: a failed or unparseable API response is an error, not a silent
+# downgrade to an unversioned build.
+resolve_latest_version() {
+  if [[ -n "$BAIZE_VERSION_PIN" ]]; then
+    printf '%s\n' "$BAIZE_VERSION_PIN"
+    return 0
+  fi
+  local json tag
+  json="$(curl -fsSL --max-time 10 \
+    "https://api.github.com/repos/${BAIZE_REPO}/releases/latest")" || return 1
+  # `*`, not `+`, inside the capture: an empty "tag_name":"" must still
+  # match (and then fail the emptiness check below), rather than leave the
+  # whole substitution a no-op that falls through with $tag holding the
+  # raw, unparsed JSON line -- which is non-empty and would otherwise sail
+  # past the check that follows.
+  tag="$(printf '%s\n' "$json" | grep -m1 '"tag_name"' \
+    | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/')"
+  [[ -n "$tag" ]] || return 1
+  printf '%s\n' "$tag"
+}
+
+# Filesystem device id for path $1, on stdout. GNU stat (Ubuntu, the
+# target host) takes -c; BSD stat (macOS, where this test suite also runs)
+# takes -f with an equivalent %d token, hence the fallback rather than one
+# or the other. `stat` is not among the runtime tools this project
+# otherwise allows itself -- it exists here only for update's
+# same-filesystem guard below, and `update` is a human-invoked maintenance
+# action, not the disk-check path that restriction protects.
+fs_device_id() {
+  stat -c '%d' "$1" 2>/dev/null || stat -f '%d' "$1" 2>/dev/null
+}
+
+# True if device ids $1 and $2 match. Split out from fs_device_id so the
+# same-filesystem guard's comparison is unit-testable with plain strings,
+# without needing two real filesystems in the test environment.
+same_device() {
+  [[ -n "$1" && "$1" == "$2" ]]
+}
+
+# Restores baize.prev over the current binary. The only path in `update`
+# that could leave a host without a previously-proven-working baize if it
+# did nothing -- so every post-swap failure calls this. cp, not mv:
+# baize.prev must survive so a repeated failure can roll back again.
+rollback_update() {
+  if [[ -f "$HOME/.local/bin/baize.prev" ]]; then
+    cp -f "$HOME/.local/bin/baize.prev" "$HOME/.local/bin/baize"
+    printf 'baize: update failed; rolled back to the previous version.\n' >&2
+  fi
+  return 1
+}
+
+# `baize update [--force]`
+#
+# Every step gates the next; a failure at any point leaves the previously
+# working ~/.local/bin/baize running, untouched. This is the only function
+# in this file that writes to ~/.local/bin/baize, and it is reachable only
+# through the verb dispatcher in main() -- never from cron, a timer, or
+# cmd_run. `update` is explicit and human-typed, on purpose: an
+# auto-updater would hand this component exactly the network dependency
+# and remote-code-execution surface it exists to not have (BRIEF
+# constraint #2). If that is not obvious from reading this file, this verb
+# has failed regardless of what its tests say.
+cmd_update() {
+  local force=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force) force=1; shift ;;
+      *)
+        printf 'baize update: unknown flag: %s\n  Valid flags: --force\n' "$1" >&2
+        return 2
+        ;;
+    esac
+  done
+
+  local target
+  target="$(resolve_latest_version)" || {
+    printf 'baize update: could not resolve the latest release. Check network and try again.\n' >&2
+    return 1
+  }
+  local target_norm="${target#v}"
+
+  if [[ "$target_norm" == "$BAIZE_VERSION" && "$force" -eq 0 ]]; then
+    printf 'Already on %s\n' "$BAIZE_VERSION"
+    return 0
+  fi
+
+  local install_dir; install_dir="$(dirname "$(bin_path)")"
+  mkdir -p "$install_dir"
+
+  # Next to the target, never /tmp: mv is an atomic rename only within one
+  # filesystem, and /tmp is very often a separate filesystem or a tmpfs. A
+  # failed update leaves a working baize; a torn swap across filesystems
+  # might not.
+  local tmp
+  tmp="$(mktemp -d "$install_dir/.baize-update.XXXXXX")" || {
+    printf 'baize update: could not create a temp dir under %s\n' "$install_dir" >&2
+    return 1
+  }
+  # shellcheck disable=SC2064  # $tmp must be baked into the trap string now:
+  # cmd_update returns rather than exits (see the shared bash conventions),
+  # so by the time this trap actually fires at process exit, $tmp -- a
+  # local variable -- would already be out of scope for a deferred
+  # (single-quoted) expansion.
+  trap "rm -rf '$tmp'" EXIT
+
+  # $HOME is not sufficient on its own to guarantee this: ~/.local can be a
+  # symlink to another mount, or $HOME itself a network mount with local
+  # disk underneath. Assert same-filesystem rather than trust it, since a
+  # wrong answer here is silent -- refusing beats a non-atomic swap.
+  local tmp_dev install_dev
+  tmp_dev="$(fs_device_id "$tmp")"
+  install_dev="$(fs_device_id "$install_dir")"
+  if ! same_device "$tmp_dev" "$install_dev"; then
+    printf 'baize: temp dir is on a different filesystem; the swap would not be atomic.\n' >&2
+    return 1
+  fi
+
+  if ! curl -fsSL --max-time 30 -o "$tmp/baize" \
+       "https://github.com/$BAIZE_REPO/releases/download/$target/baize"; then
+    printf 'baize update: could not download baize %s\n' "$target" >&2
+    return 1
+  fi
+  if ! curl -fsSL --max-time 30 -o "$tmp/SHA256SUMS" \
+       "https://github.com/$BAIZE_REPO/releases/download/$target/SHA256SUMS"; then
+    printf 'baize update: could not download SHA256SUMS for %s\n' "$target" >&2
+    return 1
+  fi
+
+  # `sha256sum -c --ignore-missing` passes vacuously if SHA256SUMS lists
+  # nothing we downloaded. Confirm baize is actually named in it before
+  # trusting a pass -- otherwise a truncated or empty SHA256SUMS would let
+  # an unverified binary through. (Mirrors install.sh's verify(); see the
+  # paired-change surface note above resolve_latest_version -- if this
+  # guard changes, mirror it there too.)
+  grep -q '[[:space:]]baize$' "$tmp/SHA256SUMS" || {
+    printf 'baize update: SHA256SUMS does not list baize. Refusing to update.\n' >&2
+    return 1
+  }
+
+  # SHA256SUMS travels the same HTTPS channel as baize itself, so this
+  # catches a truncated or corrupted download -- not a MITM or a
+  # compromised release. The real trust anchor is GitHub's TLS plus the
+  # account; this is integrity, not a signature.
+  if ! ( cd "$tmp" && sha256sum -c --ignore-missing SHA256SUMS ) >/dev/null 2>&1; then
+    printf 'baize update: checksum verification FAILED. Refusing to update.\n' >&2
+    return 1
+  fi
+
+  chmod +x "$tmp/baize"
+
+  # Self-test before anything on disk is touched. `check` is the right
+  # choice: it exercises config loading, path resolution, and df parsing
+  # while provably sending nothing -- proof the candidate can actually run
+  # on this host, not just that its bytes matched a checksum.
+  local candidate_version
+  candidate_version="$("$tmp/baize" version 2>/dev/null)" || candidate_version=""
+  if [[ ! "$candidate_version" =~ [0-9]+\.[0-9]+\.[0-9]+ ]]; then
+    printf 'baize update: downloaded baize failed its self-test (version). Refusing to update.\n' >&2
+    return 1
+  fi
+  if ! "$tmp/baize" check >/dev/null 2>&1; then
+    printf 'baize update: downloaded baize failed its self-test (check). Refusing to update.\n' >&2
+    return 1
+  fi
+
+  if ! cp -f "$(bin_path)" "$HOME/.local/bin/baize.prev"; then
+    printf 'baize update: could not back up the current binary; aborting before swap.\n' >&2
+    return 1
+  fi
+
+  # The only atomic step in this whole sequence -- everything above is
+  # preparation, everything below is verifying what just happened.
+  if ! mv -f "$tmp/baize" "$(bin_path)"; then
+    printf 'baize update: could not move the new binary into place.\n' >&2
+    return 1
+  fi
+
+  if ! "$(bin_path)" version >/dev/null 2>&1; then
+    rollback_update || true
+    return 1
+  fi
+
+  printf 'Updated baize %s -> %s\n' "$BAIZE_VERSION" "$target_norm"
+  printf 'Previous version kept at ~/.local/bin/baize.prev\n'
+}
 
 # --- Usage / dispatch ----------------------------------------------------------
 

@@ -37,9 +37,14 @@ resolve_version() {
   }
 
   # No JSON parser dependency -- the host is not allowed to need one. grep
-  # the well-known tag_name field and pull its value with sed.
+  # the well-known tag_name field and pull its value with sed. `*`, not
+  # `+`, inside the capture: an empty "tag_name":"" must still match (and
+  # then fail the emptiness check below) rather than leave the whole
+  # substitution a no-op that falls through with $tag holding the raw,
+  # unparsed JSON line. Mirrored in `baize update`'s resolve_latest_version
+  # -- see the paired-change surface note there.
   local tag
-  tag="$(printf '%s\n' "$response" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')"
+  tag="$(printf '%s\n' "$response" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/')"
 
   if [[ -z "$tag" ]]; then
     printf 'install.sh: could not find a tag_name in the releases API response.\n' >&2

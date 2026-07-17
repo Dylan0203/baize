@@ -1,20 +1,45 @@
-# baize config -- ~/.config/baize/config
-# Written by `baize install`; hand-editing is fine, this file is never
-# touched by `baize update`. Shell KEY=VALUE, sourced with `.`.
+# baize configuration -- ~/.config/baize/config
+# This file is sourced by bash. Values are shell syntax; quote anything with spaces.
+# Written by `baize install`; hand-editing is fine and expected -- `baize update`
+# never touches this file.
 
-# GlitchTip DSN -- https://<public_key>@glitchtip.example.com/<project_id>
-DSN="https://abc123@glitchtip.example.com/7"
+# REQUIRED. GlitchTip DSN for the project receiving alerts.
+# Shape: https://<public_key>@glitchtip.example.com/<project_id>
+# Use a dedicated infra project (e.g. host-monitoring), not your application's --
+# infra alerts want their own alert rules, and you do not want disk warnings
+# buried in a stream of 500s.
+# Get it wrong: missing or malformed and `baize install` refuses to write the
+# config; `baize run`/`baize test` refuse to send and say so on stderr.
+DSN="https://REPLACE_ME@glitchtip.example.com/0"
 
-# Space-separated mount points to watch.
+# Mount points to watch, space-separated.
+# Get it wrong: empty and `baize install` refuses; `baize check`/`baize run`
+# report "no readable mounts" and exit 1 if none of the listed mounts can be
+# read by `df`.
+# Default: "/"
 MOUNTS="/"
 
-# Alert when used percentage is >= this. Must be an integer 1-99.
+# Alert when used percentage reaches this value. Inclusive: 85 alerts at 85%.
+# Valid range 1-99.
+# Get it wrong: out of range or non-numeric and `baize install` refuses to
+# write the config, rather than silently clamping to something you didn't ask for.
+# Default: 85
 THRESHOLD=85
 
-# While still breached, re-send an event this often (hours).
+# While a mount is still over threshold, re-send an event this often (hours).
+# Prevents 672 events from one week-long breach.
+# Get it wrong: too low and a long breach gets noisier (still one GlitchTip
+# issue -- fingerprint still collapses them -- just more events inside it).
+# Default: 24
 RESTATE_HOURS=24
 
-# Optional GlitchTip heartbeat check-in URL. Empty/unset = heartbeat disabled.
+# OPTIONAL but strongly recommended: GlitchTip Heartbeat monitor check-in URL.
+# Without it, baize dying is indistinguishable from baize reporting good news.
+# Create: Organization Settings -> Uptime Monitors -> Create a New Uptime
+# Monitor -> Monitor Type: Heartbeat. Then paste the check-in URL from the
+# monitor's detail page here verbatim -- do not try to construct it by hand.
+# The UUID in this URL is a credential -- this file is mode 600 for that reason.
+# Default: "" (heartbeat disabled)
 HEARTBEAT_URL=""
 
 # How often cron invokes `baize run`. <N>m where N divides 60 evenly
@@ -22,4 +47,9 @@ HEARTBEAT_URL=""
 # (1 2 3 4 6 8 12). Anything else is rejected at install time -- an interval
 # that doesn't divide its unit evenly (e.g. */7) silently drifts the
 # schedule instead of firing at a constant period.
+# Get it wrong: `baize install` refuses and lists the accepted values.
+# This key is install-time metadata for the cron schedule only -- nothing at
+# runtime reads it -- kept here so a re-install without --interval keeps the
+# previous schedule instead of reverting to the default.
+# Default: "15m"
 INTERVAL="15m"

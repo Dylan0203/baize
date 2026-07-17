@@ -379,17 +379,36 @@ read_crontab() { crontab -l 2>/dev/null || true; }
 # their own entries for readability. The only blank worth removing is a
 # single leading one that appears when $current was empty, hence
 # `sed '1{/^$/d}'` rather than a global purge.
+#
+# An empty $block (what `remove` passes) removes the baize block entirely.
+# That case is written separately from the non-empty case below: piping
+# "$stripped\n$block\n" through with an empty $block always appends one
+# extra trailing blank line, which would leave the user's surviving lines
+# not-quite-byte-identical. $stripped/$out already carry no trailing
+# newline (command substitution strips it), so a plain `printf '%s\n'`
+# reattaches exactly one -- or, if nothing survived at all, writes a fully
+# empty crontab instead of a stray blank line.
 write_crontab_block() {
-  local block="$1" current stripped
+  local block="$1" current stripped out
   current="$(read_crontab)"
   stripped="$(printf '%s\n' "$current" | awk '
     /^# BEGIN baize$/ {skip=1; next}
     /^# END baize$/   {skip=0; next}
     !skip
   ')"
-  # The trailing ";" before the closing brace is needed for BSD sed (macOS
-  # dev machines); GNU sed (the Ubuntu target) accepts it identically.
-  printf '%s\n%s\n' "$stripped" "$block" | sed '1{/^$/d;}' | crontab -
+  if [[ -n "$block" ]]; then
+    # The trailing ";" before the closing brace is needed for BSD sed
+    # (macOS dev machines); GNU sed (the Ubuntu target) accepts it
+    # identically.
+    out="$(printf '%s\n%s\n' "$stripped" "$block" | sed '1{/^$/d;}')"
+  else
+    out="$stripped"
+  fi
+  if [[ -n "$out" ]]; then
+    printf '%s\n' "$out" | crontab -
+  else
+    printf '' | crontab -
+  fi
 }
 
 # The "# BEGIN baize" .. "# END baize" block for the current INTERVAL, on
@@ -499,13 +518,275 @@ Next: baize test
 SUMMARY
 }
 
+# --- Remove: farewell event, teardown, confirmation ---------------------------
+
+# True if baize has anything installed to remove: the binary, baize.prev,
+# the config dir, the state dir, or a crontab block. Lets `remove` on an
+# already-clean box report "nothing to remove" and exit 0 without prompting
+# for a destructive action that would not destroy anything.
+anything_installed() {
+  [[ -e "$(bin_path)" ]] && return 0
+  [[ -e "$HOME/.local/bin/baize.prev" ]] && return 0
+  [[ -d "$(config_dir)" ]] && return 0
+  [[ -d "$(state_dir)" ]] && return 0
+  read_crontab | grep -q '^# BEGIN baize$' && return 0
+  return 1
+}
+
+# Prompts for confirmation on /dev/tty, never stdin -- `curl | bash` leaves
+# stdin pointed at a pipe of script text, and a prompt reading stdin would
+# either consume that text or see EOF and silently take the default. When
+# there is no controlling terminal at all (a genuinely non-interactive
+# context) this requires --force instead of guessing what a human would
+# have answered. `{ exec 3<>/dev/tty; } 2>/dev/null` is the check: opening
+# /dev/tty for read+write on fd 3 fails cleanly (no controlling terminal)
+# without also killing the script the way a bare failed `exec` redirection
+# can.
+confirm_remove() {
+  local force="$1" host reply
+
+  [[ "$force" -eq 1 ]] && return 0
+
+  if ! { exec 3<>/dev/tty; } 2>/dev/null; then
+    printf 'baize remove: no controlling terminal to confirm on.\n  Re-run with --force to remove without prompting.\n' >&2
+    return 2
+  fi
+
+  host="$(server_name)"
+  {
+    printf 'This will remove baize from %s:\n' "$host"
+    printf '  cron entry, %s, %s/, %s/\n' "$(bin_path)" "$(config_dir)" "$(state_dir)"
+    printf 'Continue? [y/N] '
+  } >&3
+  read -r reply <&3
+  exec 3<&- 3>&-
+
+  [[ "$reply" =~ ^[Yy]$ ]] || { printf 'Aborted.\n'; return 1; }
+  return 0
+}
+
+# Best-effort farewell event, sent while the config still exists and before
+# any teardown. This is the sharp edge of `remove`: it runs on boxes with no
+# network, a revoked DSN, or a broken config, and must still let removal
+# complete, so nothing in here is allowed to propagate a failure upward --
+# every early exit is `return 0`, and the caller additionally wraps the
+# call in `|| true`.
+#
+# The config file is syntax-checked with `bash -n` before it is ever
+# sourced. `load_config`'s `. "$cf"` is what every other verb also uses,
+# and that is fine for them -- but a config with a genuine bash syntax
+# error makes `.` abort the whole process outright (a fatal parse error,
+# not a normal non-zero exit `set -e`/`||` can trap), which here would take
+# the removal down with it. `bash -n` only parses, never executes, so it
+# can reject that file and let this function fall through to the
+# no-announcement path instead.
+say_goodbye() {
+  local cf; cf="$(config_file)"
+  if [[ -f "$cf" ]] && ! bash -n "$cf" 2>/dev/null; then
+    printf 'Note: config file is malformed, skipping removal announcement (removing anyway).\n' >&2
+    return 0
+  fi
+
+  load_config 2>/dev/null || return 0
+  [[ -n "${DSN:-}" ]] || return 0
+
+  if send_event info BaizeRemoved \
+       "baize was removed from $(server_name)" \
+       baize-removed "-" 2>/dev/null; then
+    printf 'Announced removal to GlitchTip.\n'
+  else
+    printf 'Note: could not announce removal to GlitchTip (removing anyway).\n' >&2
+  fi
+  return 0
+}
+
+# Removes the crontab block -- first among the destructive steps, so that
+# if anything after this fails, cron is at least no longer firing a
+# half-removed baize every INTERVAL. write_crontab_block("") is exactly the
+# "remove the block" case its own doc comment describes.
+remove_cron_block() {
+  write_crontab_block ""
+}
+
+# Removes every path baize owns. Order: state, then config (unless kept),
+# then the previous-version binary, then the running script itself last --
+# see cmd_remove for why last matters. rm -rf/-f only ever targets paths
+# built fresh from bin_path/config_dir/state_dir/$HOME, never a bare
+# "$SOME_VAR" that could be empty; cmd_remove has already refused to run
+# with $HOME unset or empty, so these can never widen into "/".
+remove_files() {
+  local keep_config="$1"
+  rm -rf "$(state_dir)"
+  [[ "$keep_config" -eq 1 ]] || rm -rf "$(config_dir)"
+  rm -f "$HOME/.local/bin/baize.prev"
+  # Deleting the running script out from under itself is safe on Linux:
+  # bash already holds baize open, and the inode -- along with every line
+  # still to be read -- survives until this process exits, even though the
+  # directory entry disappears the instant this command returns.
+  rm -f "$(bin_path)"
+}
+
+# Reports what's left for the human. baize cannot delete its own GlitchTip
+# heartbeat monitor -- that needs a write-scoped token, which v0.1
+# deliberately refuses to put on a host -- so it tells the human instead.
+# Printed only when a heartbeat was actually configured; telling someone to
+# delete a monitor they never made is noise.
+print_manual_followups() {
+  local heartbeat_was_set="$1"
+  printf 'Removed baize from %s.\n' "$(server_name)"
+  if [[ "$heartbeat_was_set" -eq 1 ]]; then
+    cat <<EOF
+
+One thing left, in GlitchTip:
+  Delete the Heartbeat monitor for this host (Organization Settings -> Uptime Monitors).
+  If you leave it, it will alert in ~30 minutes because baize is no longer checking in.
+EOF
+  fi
+}
+
+# `baize remove [--force] [--keep-config]`
+#
+# Order: refuse on a broken $HOME -> confirm -> farewell (while config
+# still exists) -> cron -> state -> config -> baize.prev -> the running
+# script, last. The farewell is entirely best-effort (see say_goodbye) --
+# a box with no network, a revoked DSN, or a broken config must still end
+# up with baize fully removed.
+cmd_remove() {
+  if [[ -z "${HOME:-}" ]]; then
+    printf 'baize remove: refusing to run with HOME unset or empty\n' >&2
+    return 1
+  fi
+
+  local force=0 keep_config=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force)       force=1; shift ;;
+      --keep-config) keep_config=1; shift ;;
+      *)
+        printf 'baize remove: unknown flag: %s\n  Valid flags: --force --keep-config\n' "$1" >&2
+        return 2
+        ;;
+    esac
+  done
+
+  if ! anything_installed; then
+    printf 'baize: nothing to remove.\n'
+    return 0
+  fi
+
+  confirm_remove "$force" || return $?
+
+  say_goodbye || true   # best-effort, always; never gates what follows
+
+  # say_goodbye's own load_config call (or its no-op default when there is
+  # no config to load) leaves HEARTBEAT_URL populated as a side effect --
+  # captured here, before teardown removes the config it came from, rather
+  # than loading a second time.
+  local heartbeat_was_set=0
+  [[ -n "${HEARTBEAT_URL:-}" ]] && heartbeat_was_set=1
+
+  remove_cron_block
+  remove_files "$keep_config"
+  print_manual_followups "$heartbeat_was_set"
+}
+
 # --- Verb stubs ---------------------------------------------------------------
 # Real behavior arrives in later tasks. Each stub keeps this file lint-clean
 # and gives those tasks a defined slot to fill.
 
-cmd_remove()  { printf 'baize: not implemented yet\n' >&2; return 1; }
-cmd_check()   { printf 'baize: not implemented yet\n' >&2; return 1; }
-cmd_run()     { printf 'baize: not implemented yet\n' >&2; return 1; }
+# Human-facing report: prints per-mount usage and OVER/ok status. Sends
+# nothing -- no event, no heartbeat -- so a human debugging at the terminal
+# can never trigger an alert or fake a check-in that masks a real outage.
+# Exits 0 even when a mount is over threshold; it reports, it does not
+# judge. Exits 1 only when MOUNTS yields nothing readable at all -- that is
+# a broken config, not a healthy disk.
+cmd_check() {
+  load_config
+
+  local mount pct label found=0
+  while read -r mount pct; do
+    found=1
+    if (( pct >= THRESHOLD )); then
+      label="OVER"
+    else
+      label="ok"
+    fi
+    printf '%-12s%3s%%  %-4s (threshold %s%%)\n' "$mount" "$pct" "$label" "$THRESHOLD"
+  done < <(each_mount_pct)
+
+  if [[ "$found" -eq 0 ]]; then
+    printf 'baize: no readable mounts (checked: %s)\n' "$MOUNTS" >&2
+    return 1
+  fi
+}
+
+# Best-effort check-in. Never fails the run -- the heartbeat is how
+# GlitchTip learns baize is alive, and failing the run over it would be the
+# monitor killing itself over its own status report.
+send_heartbeat() {
+  [[ -n "${HEARTBEAT_URL:-}" ]] || return 0
+  # The check-in endpoint takes an empty body and does not care about
+  # Content-Type; this is passed only because http_post requires one.
+  if ! http_post "$HEARTBEAT_URL" "" "application/json"; then
+    printf 'baize: heartbeat check-in failed\n' >&2
+  fi
+  return 0
+}
+
+# The cron verb: check, alert only on transitions, heartbeat unconditionally.
+# Quiet on success -- cron mails any output, and a monitor that mails every
+# 15 minutes gets filtered into oblivion, taking the real alert with it.
+#
+# Three details that carry weight: state updates only on a successful send
+# (a failed POST leaves state untouched so the next run retries); the
+# while-read loop uses process substitution rather than a pipe, so its
+# updates to `found`/`exit_code` survive outside a subshell; the heartbeat
+# is last and unconditional -- it fires whether or not the mounts were
+# readable and whether or not an event went out.
+cmd_run() {
+  load_config
+  require_dsn || return 1
+
+  local now; now="$(now_epoch)"
+  local mount pct level last_sent action
+  local found=0 exit_code=0
+
+  while read -r mount pct; do
+    found=1
+    read -r level last_sent <<< "$(read_state "$mount")"
+    action="$(decide_action "$pct" "$THRESHOLD" "$level" "$last_sent" "$now" "$RESTATE_HOURS")"
+    case "$action" in
+      breach|restate)
+        if send_event warning DiskUsageHigh \
+             "Disk usage ${pct}% on ${mount} (threshold ${THRESHOLD}%)" \
+             disk-breach "$mount" "\"used_pct\":${pct},\"threshold_pct\":${THRESHOLD}"; then
+          write_state "$mount" breach "$now"
+        else
+          exit_code=1
+        fi
+        ;;
+      recovery)
+        if send_event info DiskUsageRecovered \
+             "Disk usage back to ${pct}% on ${mount} (threshold ${THRESHOLD}%)" \
+             disk-recovery "$mount" "\"used_pct\":${pct},\"threshold_pct\":${THRESHOLD}"; then
+          write_state "$mount" ok 0
+        else
+          exit_code=1
+        fi
+        ;;
+      none) : ;;
+    esac
+  done < <(each_mount_pct)
+
+  if [[ "$found" -eq 0 ]]; then
+    printf 'baize: no readable mounts (checked: %s)\n' "$MOUNTS" >&2
+    exit_code=1
+  fi
+
+  send_heartbeat
+
+  return "$exit_code"
+}
 
 # Sends one baize-test event to prove the DSN and network path both work.
 # This is the one verb whose whole purpose is proving the pipe works, so its

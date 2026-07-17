@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Stub for curl: records its full argument list to BAIZE_STUB_CURL_LOG,
+# prints a minimal JSON body, and exits with BAIZE_STUB_CURL_EXIT (default 0).
+set -euo pipefail
+
+if [[ -n "${BAIZE_STUB_CURL_LOG:-}" ]]; then
+  printf '%s\n' "$*" >> "$BAIZE_STUB_CURL_LOG"
+fi
+
+printf '{"id":"stub"}\n'
+exit "${BAIZE_STUB_CURL_EXIT:-0}"

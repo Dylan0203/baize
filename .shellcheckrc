@@ -1,0 +1,5 @@
+# SC2034 (appears unused): load_config sets DSN/MOUNTS/THRESHOLD/
+# RESTATE_HOURS/HEARTBEAT_URL as globals consumed by cmd_check/cmd_run/etc.,
+# and BAIZE_REPO is consumed by install/update — both added in later tasks.
+# shellcheck can't see forward references across the task tree.
+disable=SC2034

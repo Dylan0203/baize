@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BAIZE_VERSION="0.1.0"
+BAIZE_REPO="Dylan0203/baize"
+
+# --- Path resolution -------------------------------------------------------
+# Resolved from $HOME at call time (never at source time), so tests can move
+# HOME after sourcing. Honors XDG_CONFIG_HOME / XDG_STATE_HOME when set.
+
+config_dir() { printf '%s\n' "${XDG_CONFIG_HOME:-$HOME/.config}/baize"; }
+state_dir()  { printf '%s\n' "${XDG_STATE_HOME:-$HOME/.local/state}/baize"; }
+config_file() { printf '%s\n' "$(config_dir)/config"; }
+state_file()  { printf '%s\n' "$(state_dir)/state"; }
+bin_path()    { printf '%s\n' "$HOME/.local/bin/baize"; }
+
+# --- Config loader -----------------------------------------------------------
+# Sets globals: DSN MOUNTS THRESHOLD RESTATE_HOURS HEARTBEAT_URL
+#
+# Defaults live here; the config file (if present) overrides them via `.`.
+# A config missing keys must still work. DSN is the only required key, but
+# load_config does NOT enforce it -- `baize check` is useful without a DSN,
+# and `install` is what writes the DSN. Enforcing it is require_dsn's job.
+load_config() {
+  DSN=""
+  MOUNTS="/"
+  THRESHOLD=85
+  RESTATE_HOURS=24
+  HEARTBEAT_URL=""
+
+  local cf; cf="$(config_file)"
+  if [[ -f "$cf" ]]; then
+    # shellcheck disable=SC1090  # path is runtime-resolved by design
+    . "$cf"
+  fi
+}
+
+# Errors actionably when DSN is empty. Callers that need a DSN call this
+# after load_config; load_config itself never enforces it.
+require_dsn() {
+  if [[ -z "${DSN:-}" ]]; then
+    cat >&2 <<'EOF'
+baize: no DSN configured.
+  Expected DSN in ~/.config/baize/config
+  Run: baize install --dsn https://<key>@glitchtip.example.com/<project_id>
+EOF
+    return 1
+  fi
+}
+
+# --- The three seams ---------------------------------------------------------
+# Thin wrappers so bats stubs can intercept them. Disk logic and HTTP bodies
+# arrive in later tasks.
+
+# Current Unix epoch seconds on stdout.
+now_epoch() { date +%s; }
+
+# Used percentage (integer, no % sign) for mount $1 on stdout. Non-zero if unknown.
+disk_used_pct() { return 1; }   # implemented later — deliberately unimplemented seam
+
+# POST $2 (body, may be empty) to URL $1. Non-zero on failure. Never prints secrets.
+http_post() { return 1; }       # implemented later — deliberately unimplemented seam
+
+# --- Shared helpers ----------------------------------------------------------
+
+# This host's short name, on stdout. Never fails.
+server_name() {
+  hostname -s 2>/dev/null || hostname 2>/dev/null || printf 'unknown\n'
+}
+
+# RFC 3339 UTC timestamp for epoch seconds $1 (defaults to now), on stdout.
+# now_epoch is the only seam that ever calls `date`; this converts in pure
+# bash so nothing bypasses the test stub and reintroduces real wall-clock time.
+epoch_to_rfc3339() {
+  local epoch="${1:-$(now_epoch)}"
+  TZ=UTC printf '%(%Y-%m-%dT%H:%M:%SZ)T\n' "$epoch"
+}
+
+# --- Verb stubs ---------------------------------------------------------------
+# Real behavior arrives in later tasks. Each stub keeps this file lint-clean
+# and gives those tasks a defined slot to fill.
+
+cmd_install() { printf 'baize: not implemented yet\n' >&2; return 1; }
+cmd_remove()  { printf 'baize: not implemented yet\n' >&2; return 1; }
+cmd_check()   { printf 'baize: not implemented yet\n' >&2; return 1; }
+cmd_run()     { printf 'baize: not implemented yet\n' >&2; return 1; }
+cmd_test()    { printf 'baize: not implemented yet\n' >&2; return 1; }
+cmd_status()  { printf 'baize: not implemented yet\n' >&2; return 1; }
+cmd_update()  { printf 'baize: not implemented yet\n' >&2; return 1; }
+
+# --- Usage / dispatch ----------------------------------------------------------
+
+usage() {
+  cat <<'EOF'
+baize install [--dsn URL] [--threshold 85] [--interval 15m] [--heartbeat URL] [--dry-run]
+baize remove          Unwire cron, remove files, announce departure
+baize check           Run once, print result, send nothing
+baize run             Cron verb: check, alert on transitions, heartbeat
+baize test            Send a synthetic event to verify DSN and network
+baize status          Show config, cron state, last run, available update
+baize update          Explicitly update to the latest release
+baize version         Print version
+EOF
+}
+
+main() {
+  local verb="${1:-}"; shift || true
+  case "$verb" in
+    install) cmd_install "$@" ;;
+    remove)  cmd_remove "$@" ;;
+    check)   cmd_check "$@" ;;
+    run)     cmd_run "$@" ;;
+    test)    cmd_test "$@" ;;
+    status)  cmd_status "$@" ;;
+    update)  cmd_update "$@" ;;
+    version|--version|-v) printf 'baize %s\n' "$BAIZE_VERSION" ;;
+    help|--help|-h|"") usage ;;
+    *) printf 'baize: unknown command: %s\n' "$verb" >&2; usage >&2; exit 2 ;;
+  esac
+}
+
+if [[ -z "${BAIZE_LIB_ONLY:-}" ]]; then
+  main "$@"
+fi

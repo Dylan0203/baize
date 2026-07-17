@@ -808,7 +808,156 @@ cmd_test() {
     return 1
   fi
 }
-cmd_status()  { printf 'baize: not implemented yet\n' >&2; return 1; }
+
+# --- Status: config, cron, last alert, disk, best-effort update check --------
+
+# Cron status line for `status`: the schedule with "(active)" when baize's
+# marker block is present in the crontab, or a loud "NOT SCHEDULED" when it
+# is not. An installed-but-unscheduled baize is the precise silent failure
+# this tool exists to prevent -- it looks installed and answers `version`,
+# but alerts nobody -- so this must be impossible to miss when skimming.
+cron_status_line() {
+  local content middle schedule
+  content="$(read_crontab)"
+  middle="$(printf '%s\n' "$content" | awk '/^# BEGIN baize$/{f=1;next} /^# END baize$/{f=0} f')"
+  if [[ -n "$middle" ]]; then
+    schedule="$(awk '{print $1, $2, $3, $4, $5}' <<< "$middle")"
+    printf '%s  (active)\n' "$schedule"
+  else
+    printf 'NOT SCHEDULED  <-- baize is installed but will never run\n'
+  fi
+}
+
+# Human-readable relative time for a duration of $1 seconds, on stdout.
+relative_time() {
+  local diff="$1"
+  if (( diff < 60 )); then
+    printf '%d seconds ago\n' "$diff"
+  elif (( diff < 3600 )); then
+    printf '%d minutes ago\n' $(( diff / 60 ))
+  elif (( diff < 86400 )); then
+    printf '%d hours ago\n' $(( diff / 3600 ))
+  else
+    printf '%d days ago\n' $(( diff / 86400 ))
+  fi
+}
+
+# "Last alert" line for `status`: the most recent last_sent across MOUNTS,
+# or "never" when nothing has ever been sent.
+#
+# Labeled "Last alert", not "Last run": the state file records when an
+# event was last *sent*, not when baize last executed. A host that ran 40
+# times today and alerted zero times has a Last alert of "never", and that
+# is correct -- calling it "Last run" would read as reassurance, which is
+# exactly what let the disk fill silently in the first place. A true
+# last-run timestamp would mean a disk write on every happy-path run; the
+# heartbeat, not this line, is what proves baize is alive -- a deliberate
+# non-goal (see docs/baize-v0-1 shared context).
+last_alert_line() {
+  local mount level last_sent max_last_sent=0
+  # shellcheck disable=SC2086  # MOUNTS is space-separated by design
+  for mount in $MOUNTS; do
+    read -r level last_sent <<< "$(read_state "$mount")"
+    (( last_sent > max_last_sent )) && max_last_sent=$last_sent
+  done
+
+  if (( max_last_sent == 0 )); then
+    printf 'never\n'
+    return 0
+  fi
+
+  local now diff ts
+  now="$(now_epoch)"
+  diff=$(( now - max_last_sent ))
+  ts="$(epoch_to_rfc3339 "$max_last_sent")"
+  ts="${ts/T/ }"
+  ts="${ts%Z} UTC"
+  printf '%s  (%s)\n' "$ts" "$(relative_time "$diff")"
+}
+
+# Human-facing report: config (redacted), cron state, last alert, and disk
+# usage -- everything needed to answer "what is this host doing?" at a
+# glance. Strictly read-only: `status` never writes to disk, never installs
+# anything (BRIEF constraint #2 -- a `status` that installs is an
+# auto-updater in disguise), and sends nothing -- no event, no heartbeat --
+# so a human debugging at the terminal can never trigger an alert or fake a
+# check-in that masks a real outage.
+#
+# Exits 0 whenever it can report, even when the news is bad (over
+# threshold, not scheduled, update check failed). Exits non-zero only when
+# there is no config at all -- the one case where the fix really is
+# `baize install`.
+cmd_status() {
+  local cf; cf="$(config_file)"
+  if [[ ! -f "$cf" ]]; then
+    printf 'baize: no config found at %s\n  Run: baize install --dsn https://<key>@glitchtip.example.com/<project_id>\n' "$cf" >&2
+    return 1
+  fi
+
+  load_config
+
+  # --- Version / update check -------------------------------------------
+  # Best-effort: `status` is often run precisely because the network is
+  # broken, so a failed check must never fail the whole command -- it
+  # prints "(update check unavailable)" and everything else still prints.
+  # resolve_latest_version already caps itself at a 10s curl --max-time;
+  # that is the only network call `status` ever makes.
+  local version_line="baize $BAIZE_VERSION"
+  local latest
+  if latest="$(resolve_latest_version 2>/dev/null)"; then
+    local latest_norm="${latest#v}"
+    [[ "$latest_norm" != "$BAIZE_VERSION" ]] && version_line+="  (update available: $latest_norm)"
+  else
+    version_line+="  (update check unavailable)"
+  fi
+  printf '%s\n\n' "$version_line"
+
+  # --- Config, redacted ---------------------------------------------------
+  # DSN: rebuilt from parse_dsn's components rather than regex-replacing
+  # the raw DSN, so a malformed DSN that doesn't match the expected shape
+  # can never leak a key by falling through unredacted.
+  local dsn_display="(none configured)"
+  if [[ -n "$DSN" ]]; then
+    if parse_dsn "$DSN"; then
+      dsn_display="https://***@${DSN_HOST}/${DSN_PROJECT}"
+    else
+      dsn_display="(malformed)"
+    fi
+  fi
+  # HEARTBEAT_URL is never printed, not even truncated -- that UUID is the
+  # entire authentication for the check-in endpoint.
+  local heartbeat_display="not configured"
+  [[ -n "$HEARTBEAT_URL" ]] && heartbeat_display="configured"
+
+  # The replacement's "~" must be backslash-escaped: unescaped, bash
+  # tilde-expands it against the real OS home directory (a getpwnam
+  # lookup), not against $HOME as reassigned for tests -- an unescaped
+  # version passes every bats test (which never overrides getpwnam) yet
+  # prints the wrong path on a real host.
+  local cf_display="${cf/#$HOME/\~}"
+  printf 'Config     %s\n' "$cf_display"
+  printf '  DSN        %s\n' "$dsn_display"
+  printf '  MOUNTS     %s\n' "$MOUNTS"
+  printf '  THRESHOLD  %s%%\n' "$THRESHOLD"
+  printf '  RESTATE    %sh\n' "$RESTATE_HOURS"
+  printf '  HEARTBEAT  %s\n' "$heartbeat_display"
+  printf '\n'
+
+  # --- Cron and last alert ------------------------------------------------
+  printf 'Cron       %s\n' "$(cron_status_line)"
+  printf 'Last alert %s\n' "$(last_alert_line)"
+  printf '\n'
+
+  # --- Disk ----------------------------------------------------------------
+  printf 'Disk\n'
+  local mount pct label
+  while read -r mount pct; do
+    if (( pct >= THRESHOLD )); then label="OVER"; else label="ok"; fi
+    printf '  %-10s %3s%%  %s\n' "$mount" "$pct" "$label"
+  done < <(each_mount_pct)
+
+  return 0
+}
 
 # --- Update: release resolution, verified atomic swap, rollback --------------
 
@@ -1021,7 +1170,7 @@ baize remove          Unwire cron, remove files, announce departure
 baize check           Run once, print result, send nothing
 baize run             Cron verb: check, alert on transitions, heartbeat
 baize test            Send a synthetic event to verify DSN and network
-baize status          Show config, cron state, last run, available update
+baize status          Show config, cron state, last alert, available update
 baize update          Explicitly update to the latest release
 baize version         Print version
 EOF

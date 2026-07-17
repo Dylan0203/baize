@@ -32,6 +32,14 @@ for arg in "$@"; do
   url="$arg"
 done
 
+# BAIZE_STUB_CURL_EXIT, when set to a non-zero value, fails every curl
+# invocation regardless of URL -- the "network is completely gone" case,
+# strictly harder than (and a superset of) BAIZE_STUB_CURL_RELEASES_FAIL's
+# single-endpoint failure below.
+if [[ -n "${BAIZE_STUB_CURL_EXIT:-}" && "${BAIZE_STUB_CURL_EXIT}" != "0" ]]; then
+  exit "$BAIZE_STUB_CURL_EXIT"
+fi
+
 write_out() {   # write_out BODY -- to $outfile if set, else stdout
   if [[ -n "$outfile" ]]; then
     printf '%s' "$1" > "$outfile"

@@ -20,6 +20,7 @@ state_dir()  { printf '%s\n' "${XDG_STATE_HOME:-$HOME/.local/state}/baize"; }
 config_file() { printf '%s\n' "$(config_dir)/config"; }
 state_file()  { printf '%s\n' "$(state_dir)/state"; }
 bin_path()    { printf '%s\n' "$HOME/.local/bin/baize"; }
+prev_path()   { printf '%s.prev\n' "$(bin_path)"; }
 
 # --- Config loader -----------------------------------------------------------
 # Sets globals: DSN MOUNTS THRESHOLD RESTATE_HOURS HEARTBEAT_URL INTERVAL
@@ -63,8 +64,8 @@ EOF
 }
 
 # --- The three seams ---------------------------------------------------------
-# Thin wrappers so bats stubs can intercept them. Disk logic and HTTP bodies
-# arrive in later tasks.
+# Thin wrappers around wall-clock, disk, and network so bats stubs can
+# intercept them; nothing else in the file calls date/df/curl directly.
 
 # Current Unix epoch seconds on stdout.
 now_epoch() { date +%s; }
@@ -241,11 +242,10 @@ send_event() {
 
 # Prints "<level> <last_sent_epoch>" for mount $1. Prints "ok 0" when unknown.
 read_state() {
-  local mount="$1" sf line
+  local mount="$1" sf
   sf="$(state_file)"
   [[ -r "$sf" ]] || { printf 'ok 0\n'; return 0; }
-  line="$(awk -v m="$mount" 'BEGIN {found=0} $1 == m {print $2, $3; found=1} END {if (!found) print "ok", 0}' "$sf")"
-  printf '%s\n' "$line"
+  awk -v m="$mount" '$1 == m {print $2, $3; found=1} END {if (!found) print "ok", 0}' "$sf"
 }
 
 # Warns on stderr that the state file could not be written. Never fails the
@@ -259,6 +259,10 @@ write_state() {
   local mount="$1" level="$2" sent="$3" sf tmp
   sf="$(state_file)"
   mkdir -p "$(dirname "$sf")" 2>/dev/null || { warn_state; return 0; }
+  # An existing-but-unreadable state file cannot be merged -- overwriting it
+  # would silently drop every other mount's line. Warn and leave it untouched
+  # so the next run retries, rather than clobbering state we could not read.
+  if [[ -e "$sf" && ! -r "$sf" ]]; then warn_state; return 0; fi
   tmp="$(mktemp "${sf}.XXXXXX" 2>/dev/null)" || { warn_state; return 0; }
   if { [[ -r "$sf" ]] && awk -v m="$mount" '$1 != m' "$sf"; printf '%s %s %s\n' "$mount" "$level" "$sent"; } > "$tmp" \
     && mv -f "$tmp" "$sf"; then
@@ -283,10 +287,8 @@ write_state() {
 #   none     -> unchanged
 decide_action() {
   local pct="$1" threshold="$2" level="$3" last_sent="$4" now="$5" restate_hours="$6"
-  local over=0
-  (( pct >= threshold )) && over=1
 
-  if (( over == 1 )); then
+  if (( pct >= threshold )); then
     if [[ "$level" != "breach" ]]; then
       printf 'breach\n'
     elif (( now - last_sent >= restate_hours * 3600 )); then
@@ -418,16 +420,17 @@ write_crontab_block() {
   fi
 }
 
-# The "# BEGIN baize" .. "# END baize" block for the current INTERVAL, on
-# stdout. Uses the expanded absolute path from bin_path, not "$HOME/..." --
-# cron's environment is not a login shell, and while $HOME is set there,
-# relying on it buys nothing and only surprises whoever reads `crontab -l`.
-# No PATH= line is added: cron's PATH (typically /usr/bin:/bin) already
-# covers curl/df/sha256sum/date/hostname on Ubuntu, so one would be
+# The "# BEGIN baize" .. "# END baize" block for cron schedule $1 (already
+# validated by cron_schedule_from_interval), on stdout. Takes the schedule as
+# an argument rather than re-deriving it from INTERVAL so cmd_install computes
+# it exactly once. Uses the expanded absolute path from bin_path, not
+# "$HOME/..." -- cron's environment is not a login shell, and while $HOME is
+# set there, relying on it buys nothing and only surprises whoever reads
+# `crontab -l`. No PATH= line is added: cron's PATH (typically /usr/bin:/bin)
+# already covers curl/df/sha256sum/date/hostname on Ubuntu, so one would be
 # speculative.
 cron_block() {
-  local schedule
-  schedule="$(cron_schedule_from_interval "$INTERVAL")" || return 1
+  local schedule="$1"
   printf '# BEGIN baize\n%s %s run\n# END baize' "$schedule" "$(bin_path)"
 }
 
@@ -496,7 +499,7 @@ cmd_install() {
 
   local body block cfile
   body="$(render_config)"
-  block="$(cron_block)"
+  block="$(cron_block "$schedule")"
   cfile="$(config_file)"
 
   if [[ "$dry_run" -eq 1 ]]; then
@@ -533,7 +536,7 @@ SUMMARY
 # for a destructive action that would not destroy anything.
 anything_installed() {
   [[ -e "$(bin_path)" ]] && return 0
-  [[ -e "$HOME/.local/bin/baize.prev" ]] && return 0
+  [[ -e "$(prev_path)" ]] && return 0
   [[ -d "$(config_dir)" ]] && return 0
   [[ -d "$(state_dir)" ]] && return 0
   read_crontab | grep -q '^# BEGIN baize$' && return 0
@@ -625,7 +628,7 @@ remove_files() {
   local keep_config="$1"
   rm -rf "$(state_dir)"
   [[ "$keep_config" -eq 1 ]] || rm -rf "$(config_dir)"
-  rm -f "$HOME/.local/bin/baize.prev"
+  rm -f "$(prev_path)"
   # Deleting the running script out from under itself is safe on Linux:
   # bash already holds baize open, and the inode -- along with every line
   # still to be read -- survives until this process exits, even though the
@@ -697,9 +700,7 @@ cmd_remove() {
   print_manual_followups "$heartbeat_was_set"
 }
 
-# --- Verb stubs ---------------------------------------------------------------
-# Real behavior arrives in later tasks. Each stub keeps this file lint-clean
-# and gives those tasks a defined slot to fill.
+# --- Check / run / test verbs -------------------------------------------------
 
 # Human-facing report: prints per-mount usage and OVER/ok status. Sends
 # nothing -- no event, no heartbeat -- so a human debugging at the terminal
@@ -1019,8 +1020,8 @@ same_device() {
 # did nothing -- so every post-swap failure calls this. cp, not mv:
 # baize.prev must survive so a repeated failure can roll back again.
 rollback_update() {
-  if [[ -f "$HOME/.local/bin/baize.prev" ]]; then
-    cp -f "$HOME/.local/bin/baize.prev" "$HOME/.local/bin/baize"
+  if [[ -f "$(prev_path)" ]]; then
+    cp -f "$(prev_path)" "$(bin_path)"
     printf 'baize: update failed; rolled back to the previous version.\n' >&2
   fi
   return 1
@@ -1140,7 +1141,7 @@ cmd_update() {
     return 1
   fi
 
-  if ! cp -f "$(bin_path)" "$HOME/.local/bin/baize.prev"; then
+  if ! cp -f "$(bin_path)" "$(prev_path)"; then
     printf 'baize update: could not back up the current binary; aborting before swap.\n' >&2
     return 1
   fi

@@ -95,12 +95,10 @@ load 'helpers/setup'
   [ "$output" = "sourced-ok" ]
 }
 
-@test "每個 cmd_* 動詞都存在，未實作時印出 not implemented yet 並回傳非零" {
+@test "每個 cmd_* 動詞都已定義為函式" {
   BAIZE_LIB_ONLY=1 source "$BAIZE_BIN"
   for cmd in cmd_install cmd_remove cmd_check cmd_run cmd_test cmd_status cmd_update; do
-    run "$cmd"
-    [ "$status" -ne 0 ]
-    [[ "$output" == *"not implemented yet"* ]]
+    declare -F "$cmd" >/dev/null || { printf 'missing verb: %s\n' "$cmd"; return 1; }
   done
 }
 

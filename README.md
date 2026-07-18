@@ -1,7 +1,5 @@
 # baize (白澤)
 
-[![CI](https://github.com/Dylan0203/baize/actions/workflows/ci.yml/badge.svg)](https://github.com/Dylan0203/baize/actions/workflows/ci.yml)
-
 > 白澤知曉天下所有災異鬼怪,將每一種災禍列給黃帝聽,讓他能預先防備。
 
 A host-level disk monitor that reports to GlitchTip before the disk fills up.
@@ -164,16 +162,21 @@ minutes because baize stopped checking in.
 ## Development
 
 ```sh
-shellcheck baize install.sh test/helpers/stubs/*
-bats test/
+bin/check                       # shellcheck (no exclusions) + the full bats suite
 ```
 
-Both run in CI (`.github/workflows/ci.yml`) on every push and PR, with no
-`shellcheck` exclusions.
+There is no CI service — `bin/check` is the gate a change must pass, run it
+yourself before shipping. It is exactly `shellcheck baize install.sh
+test/helpers/stubs/* bin/*` followed by `bats test/`.
 
 **Release procedure**: bump the `BAIZE_VERSION` constant near the top of
-`baize`, commit, then tag and push — `git tag v0.1.1 && git push origin v0.1.1`.
-`.github/workflows/release.yml` re-runs shellcheck and bats, refuses the
-release if the pushed tag doesn't match `BAIZE_VERSION`, computes
-`SHA256SUMS`, and publishes a GitHub release with `baize` and `SHA256SUMS`
-attached (release notes are auto-generated from commits).
+`baize`, commit, then cut the release locally:
+
+```sh
+bin/release v0.1.1
+```
+
+`bin/release` refuses a tag that doesn't match `BAIZE_VERSION`, runs
+`bin/check`, computes `SHA256SUMS`, tags and pushes, and publishes a GitHub
+release with `baize` and `SHA256SUMS` attached (release notes auto-generated
+from commits). It needs the `gh` CLI authenticated.

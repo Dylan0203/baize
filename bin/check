@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Local CI: the exact gate a change must pass before shipping — shellcheck
+# with no exclusions, then the full bats suite. Run it yourself; there is no
+# CI service. Exits non-zero on the first failure.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+printf '==> shellcheck\n'
+shellcheck baize install.sh test/helpers/stubs/* bin/check bin/release
+
+printf '==> bats\n'
+bats test/
+
+printf 'OK\n'

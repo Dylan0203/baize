@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Cut a release locally — no CI service. Verifies the tree, checks the tag
+# against the source version, checksums the artifact exactly as install.sh
+# will verify it, then tags and publishes a GitHub release with `baize` and
+# `SHA256SUMS` attached.
+#
+# Usage: bin/release v0.1.0
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+tag="${1:-}"
+if [[ -z "$tag" ]]; then
+  printf 'usage: bin/release vX.Y.Z\n' >&2
+  exit 2
+fi
+
+# The tag carries a leading `v`; the BAIZE_VERSION constant does not. Refuse a
+# mismatch so a release can never disagree with the version it ships.
+version="${tag#v}"
+src="$(grep -m1 '^BAIZE_VERSION=' baize | cut -d'"' -f2)"
+if [[ "$version" != "$src" ]]; then
+  printf 'release: tag %s does not match BAIZE_VERSION=%s in baize\n' "$tag" "$src" >&2
+  exit 1
+fi
+
+# Never ship a red tree.
+bin/check
+
+# Checksum the released artifact in the same format install.sh verifies with
+# `sha256sum -c` ("<hash>  baize").
+sha256sum baize > SHA256SUMS
+
+# Tag if it doesn't exist yet, push it, then publish the release. Release notes
+# are auto-generated from commits.
+if ! git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+  git tag "$tag"
+fi
+git push origin "$tag"
+gh release create "$tag" baize SHA256SUMS --generate-notes
+
+printf 'released %s\n' "$tag"

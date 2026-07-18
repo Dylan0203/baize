@@ -1,2 +1,5 @@
 tmp/
 *.tmp
+
+# cockpit session decision logs (never commit — sensitive session transcripts)
+.cockpit/

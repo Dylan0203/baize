@@ -25,13 +25,12 @@ baize status   # config, cron state, current disk
 
 ## Why
 
-On a past date a production host silently filled to 87% disk usage. A
-zombie, unmonitored native Redis had been failing `bgsave` for a year,
-leaking orphaned temp files. Once the disk got tight enough, the app's own
-Dockerized Redis hit `stop-writes-on-bgsave-error` and refused all writes —
-nine shipment notifications failed before it self-recovered. Nobody knew
-the disk was tight until the application started throwing exceptions. See
-[BRIEF.md](BRIEF.md) for the full incident writeup.
+An in-app disk check dies exactly when you need it: a full disk breaks the
+app, its job queue, and its database at once, so a scheduled task *inside*
+the app goes down with them and alerts nobody. baize runs as an independent
+cron job with no runtime dependency on anything it monitors, so it can warn
+you **before** the disk fills — not after the application starts throwing
+exceptions.
 
 ## How it works
 

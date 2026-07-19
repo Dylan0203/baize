@@ -121,10 +121,10 @@ load 'helpers/setup'
 
 @test "SERVER_NAME 設定時,server_name 印出該值而非系統 hostname" {
   BAIZE_LIB_ONLY=1 source "$BAIZE_BIN"
-  SERVER_NAME="web-2"
+  SERVER_NAME="web-1"
   run server_name
   [ "$status" -eq 0 ]
-  [ "$output" = "web-2" ]
+  [ "$output" = "web-1" ]
 }
 
 @test "SERVER_NAME 為空時,server_name fall back 到系統 hostname" {

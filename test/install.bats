@@ -26,9 +26,9 @@ DSN_OK='https://abc123@glitchtip.example.com/7'
 }
 
 @test "--hostname 寫進 config 的 SERVER_NAME" {
-  run "$BAIZE_BIN" install --dsn "$DSN_OK" --hostname web-2
+  run "$BAIZE_BIN" install --dsn "$DSN_OK" --hostname web-1
   [ "$status" -eq 0 ]
-  grep -q 'SERVER_NAME="web-2"' "$HOME/.config/baize/config"
+  grep -q 'SERVER_NAME="web-1"' "$HOME/.config/baize/config"
 }
 
 @test "重裝時不給 --hostname，既有 SERVER_NAME 保留" {

@@ -45,10 +45,10 @@ use_real_binary_as_candidate() {
 
 @test "已是最新版時,不下載,印出 already on latest,exit 0" {
   install_fake_binary
-  export BAIZE_STUB_RELEASES_JSON='{"tag_name":"v0.1.0"}'
+  export BAIZE_STUB_RELEASES_JSON='{"tag_name":"v0.1.1"}'
   run "$BAIZE_BIN" update
   [ "$status" -eq 0 ]
-  [[ "$output" == *"Already on 0.1.0"* ]]
+  [[ "$output" == *"Already on 0.1.1"* ]]
   grep -q 'releases/latest' "$BAIZE_STUB_CURL_LOG"
   ! grep -q 'releases/download' "$BAIZE_STUB_CURL_LOG"
 }
@@ -63,12 +63,12 @@ use_real_binary_as_candidate() {
   [ -f "$HOME/.local/bin/baize.prev" ]
 }
 
-@test "BAIZE_VERSION=v0.1.0 時不打 API" {
+@test "BAIZE_VERSION=v0.1.1 時不打 API" {
   install_fake_binary
-  export BAIZE_VERSION="v0.1.0"
+  export BAIZE_VERSION="v0.1.1"
   run "$BAIZE_BIN" update
   [ "$status" -eq 0 ]
-  [[ "$output" == *"Already on 0.1.0"* ]]
+  [[ "$output" == *"Already on 0.1.1"* ]]
   [ ! -s "$BAIZE_STUB_CURL_LOG" ]
 }
 

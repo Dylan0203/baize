@@ -67,7 +67,7 @@ load 'helpers/setup'
 @test "baize version 印出版本且 exit 0" {
   run "$BAIZE_BIN" version
   [ "$status" -eq 0 ]
-  [ "$output" = "baize 0.1.0" ]
+  [ "$output" = "baize 0.1.1" ]
 }
 
 @test "baize help 印出用法且 exit 0" {
@@ -117,6 +117,40 @@ load 'helpers/setup'
   '
   [ "$status" -eq 0 ]
   [ "$output" = "unknown" ]
+}
+
+@test "SERVER_NAME 設定時,server_name 印出該值而非系統 hostname" {
+  BAIZE_LIB_ONLY=1 source "$BAIZE_BIN"
+  SERVER_NAME="web-2"
+  run server_name
+  [ "$status" -eq 0 ]
+  [ "$output" = "web-2" ]
+}
+
+@test "SERVER_NAME 為空時,server_name fall back 到系統 hostname" {
+  run bash -c '
+    hostname() { printf "real-host\n"; }
+    BAIZE_LIB_ONLY=1 source "'"$BAIZE_BIN"'"
+    SERVER_NAME=""
+    server_name
+  '
+  [ "$status" -eq 0 ]
+  [ "$output" = "real-host" ]
+}
+
+@test "load_config 預設 SERVER_NAME 為空" {
+  BAIZE_LIB_ONLY=1 source "$BAIZE_BIN"
+  load_config
+  [ -z "$SERVER_NAME" ]
+}
+
+@test "config 設定 SERVER_NAME 時 load_config 讀入,server_name 用它" {
+  write_config 'DSN="https://k@glitchtip.example.com/7"' 'SERVER_NAME="web-1"'
+  BAIZE_LIB_ONLY=1 source "$BAIZE_BIN"
+  load_config
+  [ "$SERVER_NAME" = "web-1" ]
+  run server_name
+  [ "$output" = "web-1" ]
 }
 
 @test "epoch_to_rfc3339 1752710400 印出正確的 UTC 字串" {

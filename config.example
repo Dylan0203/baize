@@ -42,6 +42,15 @@ RESTATE_HOURS=24
 # Default: "" (heartbeat disabled)
 HEARTBEAT_URL=""
 
+# OPTIONAL: the name this host reports as, in event payloads and fingerprints.
+# Empty = use the OS hostname (`hostname -s`). Set it (or pass `--hostname NAME`
+# to `baize install`) when the OS hostname is unset or generic -- a box whose
+# hostname is "localhost" would otherwise attribute every disk issue to
+# "localhost", and several such hosts would collide onto one issue in a shared
+# project. Set per host so silence and breaches are always traceable.
+# Default: "" (use the OS hostname)
+SERVER_NAME=""
+
 # How often cron invokes `baize run`. <N>m where N divides 60 evenly
 # (1 2 3 4 5 6 10 12 15 20 30), or <N>h where N divides 24 evenly
 # (1 2 3 4 6 8 12). Anything else is rejected at install time -- an interval

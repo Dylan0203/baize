@@ -107,7 +107,7 @@ DSN_OK='https://abc123@glitchtip.example.com/7'
 @test "已是最新版時不顯示 update available" {
   BAIZE_LIB_ONLY=1 source "$BAIZE_BIN"
   cmd_install --dsn "$DSN_OK" >/dev/null
-  export BAIZE_STUB_RELEASES_JSON='{"tag_name":"v0.1.0"}'
+  export BAIZE_STUB_RELEASES_JSON='{"tag_name":"v0.1.1"}'
   run cmd_status
   [ "$status" -eq 0 ]
   [[ "$output" != *"update available"* ]]

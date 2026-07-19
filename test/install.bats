@@ -25,6 +25,19 @@ DSN_OK='https://abc123@glitchtip.example.com/7'
   grep -q "DSN=\"$DSN_OK\"" "$HOME/.config/baize/config"
 }
 
+@test "--hostname 寫進 config 的 SERVER_NAME" {
+  run "$BAIZE_BIN" install --dsn "$DSN_OK" --hostname web-2
+  [ "$status" -eq 0 ]
+  grep -q 'SERVER_NAME="web-2"' "$HOME/.config/baize/config"
+}
+
+@test "重裝時不給 --hostname，既有 SERVER_NAME 保留" {
+  "$BAIZE_BIN" install --dsn "$DSN_OK" --hostname web-1
+  run "$BAIZE_BIN" install --threshold 90
+  [ "$status" -eq 0 ]
+  grep -q 'SERVER_NAME="web-1"' "$HOME/.config/baize/config"
+}
+
 @test "重裝時只給 --threshold 90，DSN、MOUNTS、HEARTBEAT_URL 全部保留" {
   "$BAIZE_BIN" install --dsn "$DSN_OK" --heartbeat 'https://hb.example/x'
   run "$BAIZE_BIN" install --threshold 90

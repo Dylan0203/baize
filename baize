@@ -8,7 +8,7 @@ set -euo pipefail
 # before resolve_latest_version ever saw it. See resolve_latest_version.
 BAIZE_VERSION_PIN="${BAIZE_VERSION:-}"
 
-BAIZE_VERSION="0.1.0"
+BAIZE_VERSION="0.1.1"
 BAIZE_REPO="Dylan0203/baize"
 
 # --- Path resolution -------------------------------------------------------
@@ -42,6 +42,7 @@ load_config() {
   RESTATE_HOURS=24
   HEARTBEAT_URL=""
   INTERVAL="15m"
+  SERVER_NAME=""
 
   local cf; cf="$(config_file)"
   if [[ -f "$cf" ]]; then
@@ -123,6 +124,14 @@ http_post() {
 
 # This host's short name, on stdout. Never fails.
 server_name() {
+  # An explicit SERVER_NAME (config or --hostname) wins, so a host whose OS
+  # hostname is unset ("localhost") can still be attributed correctly. Falls
+  # back to the OS hostname, then a literal "unknown" -- never empty, so the
+  # fingerprint always groups under a name.
+  if [[ -n "${SERVER_NAME:-}" ]]; then
+    printf '%s\n' "$SERVER_NAME"
+    return 0
+  fi
   hostname -s 2>/dev/null || hostname 2>/dev/null || printf 'unknown\n'
 }
 
@@ -335,6 +344,11 @@ RESTATE_HOURS=$RESTATE_HOURS
 # Optional GlitchTip heartbeat check-in URL. Empty/unset = heartbeat disabled.
 HEARTBEAT_URL="$HEARTBEAT_URL"
 
+# Name this host reports as, in events and fingerprints. Empty = use the OS
+# hostname. Set this when the OS hostname is unset ("localhost") or ambiguous,
+# so per-host issues in a shared project never collide.
+SERVER_NAME="$SERVER_NAME"
+
 # How often cron invokes \`baize run\`. <N>m where N divides 60 evenly
 # (1 2 3 4 5 6 10 12 15 20 30), or <N>h where N divides 24 evenly
 # (1 2 3 4 6 8 12). Anything else is rejected at install time -- an interval
@@ -434,7 +448,7 @@ cron_block() {
   printf '# BEGIN baize\n%s %s run\n# END baize' "$schedule" "$(bin_path)"
 }
 
-# `baize install [--dsn URL] [--threshold N] [--interval Nm|Nh] [--heartbeat URL] [--dry-run]`
+# `baize install [--dsn URL] [--threshold N] [--interval Nm|Nh] [--heartbeat URL] [--hostname NAME] [--dry-run]`
 #
 # Merge order per key is flag -> existing config -> built-in default:
 # load_config first populates existing-or-default, then flags override, then
@@ -442,12 +456,12 @@ cron_block() {
 # appending is how repeated installs end up with duplicate keys where the
 # last one silently wins.
 cmd_install() {
-  local dsn="" threshold="" interval="" heartbeat="" dry_run=0
-  local dsn_given=0 threshold_given=0 interval_given=0 heartbeat_given=0
+  local dsn="" threshold="" interval="" heartbeat="" hostname="" dry_run=0
+  local dsn_given=0 threshold_given=0 interval_given=0 heartbeat_given=0 hostname_given=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --dsn|--threshold|--interval|--heartbeat)
+      --dsn|--threshold|--interval|--heartbeat|--hostname)
         if [[ $# -lt 2 ]]; then
           printf 'baize install: %s requires a value\n' "$1" >&2
           return 2
@@ -457,6 +471,7 @@ cmd_install() {
           --threshold) threshold="$2"; threshold_given=1 ;;
           --interval)  interval="$2";  interval_given=1 ;;
           --heartbeat) heartbeat="$2"; heartbeat_given=1 ;;
+          --hostname)  hostname="$2";  hostname_given=1 ;;
         esac
         shift 2
         ;;
@@ -465,7 +480,7 @@ cmd_install() {
         shift
         ;;
       *)
-        printf 'baize install: unknown flag: %s\n  Valid flags: --dsn --threshold --interval --heartbeat --dry-run\n' "$1" >&2
+        printf 'baize install: unknown flag: %s\n  Valid flags: --dsn --threshold --interval --heartbeat --hostname --dry-run\n' "$1" >&2
         return 2
         ;;
     esac
@@ -476,6 +491,7 @@ cmd_install() {
   [[ "$threshold_given" -eq 1 ]] && THRESHOLD="$threshold"
   [[ "$interval_given" -eq 1 ]]  && INTERVAL="$interval"
   [[ "$heartbeat_given" -eq 1 ]] && HEARTBEAT_URL="$heartbeat"
+  [[ "$hostname_given" -eq 1 ]]  && SERVER_NAME="$hostname"
 
   # --- Validate up front; every error names the fix. ---
   if [[ -z "$DSN" ]]; then
@@ -1166,7 +1182,7 @@ cmd_update() {
 
 usage() {
   cat <<'EOF'
-baize install [--dsn URL] [--threshold 85] [--interval 15m] [--heartbeat URL] [--dry-run]
+baize install [--dsn URL] [--threshold 85] [--interval 15m] [--heartbeat URL] [--hostname NAME] [--dry-run]
 baize remove          Unwire cron, remove files, announce departure
 baize check           Run once, print result, send nothing
 baize run             Cron verb: check, alert on transitions, heartbeat
